@@ -32,6 +32,12 @@ export interface TelegramUpdate {
   };
 }
 
+export interface TelegramReplyMarkup {
+  keyboard: { text: string }[][];
+  resize_keyboard?: boolean;
+  is_persistent?: boolean;
+}
+
 export class TelegramService {
   private token: string;
   private apiBaseUrl: string;
@@ -53,7 +59,8 @@ export class TelegramService {
   async sendMessage(
     chatId: number | string,
     text: string,
-    parseMode: "Markdown" | "HTML" = "Markdown"
+    parseMode: "Markdown" | "HTML" = "Markdown",
+    replyMarkup?: TelegramReplyMarkup
   ): Promise<{ message_id: number }> {
     const res = await fetch(`${this.apiBaseUrl}/sendMessage`, {
       method: "POST",
@@ -62,6 +69,7 @@ export class TelegramService {
         chat_id: chatId,
         text,
         parse_mode: parseMode,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
       }),
     });
     const data = (await res.json()) as any;
@@ -73,6 +81,7 @@ export class TelegramService {
         body: JSON.stringify({
           chat_id: chatId,
           text,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
         }),
       });
       const fbData = (await fallback.json()) as any;

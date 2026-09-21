@@ -19,7 +19,7 @@ import {
   splitVideo,
   splitBinaryFile,
 } from "./server/splitter.ts";
-import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
+import { TelegramService, TelegramBotInfo, TelegramReplyMarkup } from "./server/telegram.ts";
 import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
@@ -94,6 +94,12 @@ let botInfo: TelegramBotInfo | null = null;
 let isPolling = false;
 let pollingOffset = 0;
 let pollingTimeoutId: NodeJS.Timeout | null = null;
+
+const botReplyKeyboard: TelegramReplyMarkup = {
+  keyboard: [[{ text: "/queue" }, { text: "/tasks" }], [{ text: "/status" }, { text: "/help" }]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
 
 // Jobs persistence file
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
@@ -209,7 +215,9 @@ async function pollTelegramUpdates() {
             `• terabox.com, terabox.app, teraboxlink.com\n` +
             `• 1024tera.com, 1024terabox.com, terafileshare.com\n` +
             `• nephobox, mirrobox, 4funbox, dubox, and all shortlinks!\n\n` +
-            `_ZIP archives are automatically unpacked and videos are formatted for streaming._`
+            `_ZIP archives are automatically unpacked and videos are formatted for streaming._`,
+          "Markdown",
+          botReplyKeyboard
         );
         continue;
       }
@@ -221,7 +229,9 @@ async function pollTelegramUpdates() {
             `1. Paste any TeraBox share link.\n` +
           `2. I’ll download the files and check that they are valid.\n` +
           `3. ZIP files are unpacked automatically.\n` +
-          `4. Large files are sent in full when possible, or split into smaller parts.`
+          `4. Large files are sent in full when possible, or split into smaller parts.\n\n` +
+          `📋 /queue or /tasks - See the current and waiting downloads.\n` +
+          `⚡ /status - See bot health and queue counts.`
         );
         continue;
       }
@@ -234,7 +244,32 @@ async function pollTelegramUpdates() {
           chatId,
           `⚡ *Bot Status:* Online\n` +
             `📥 *Active Jobs:* ${activeCount}\n` +
+            `⏳ *Waiting in Queue:* ${downloadQueue.length}\n` +
             `📁 *Total Processed:* ${jobs.length}`
+        );
+        continue;
+      }
+
+      if (text === "/queue" || text === "/tasks") {
+        const activeJob = jobs.find(
+          (j) => j.status !== "completed" && j.status !== "failed"
+        );
+        const queueLines = downloadQueue.map(
+          (task, index) => `${index + 1}. ${task.url}`
+        );
+        const activeLine = activeJob
+          ? `🔄 *Now processing:* ${activeJob.url}\n`
+          : "🔄 *Now processing:* Nothing\n";
+        const waitingLines = queueLines.length
+          ? `\n⏳ *Waiting links:*\n${queueLines.join("\n")}`
+          : "\n✅ No links are waiting.";
+
+        await telegramService.sendMessage(
+          chatId,
+          `📋 *Download Queue*\n\n` +
+            activeLine +
+            `⏱️ *Waiting:* ${downloadQueue.length}` +
+            waitingLines
         );
         continue;
       }
