@@ -65,7 +65,13 @@ export default function App() {
             <span className="text-slate-200">Telegram Polling Daemon</span>
           </div>
           <div className="flex justify-between items-center text-slate-400">
-            <span>50 MB Splitter:</span>
+            <span>MTProto 2 GB Upload:</span>
+            <span className={status?.hasApiCredentials ? "text-emerald-400 font-semibold" : "text-amber-400"}>
+              {status?.hasApiCredentials ? "Enabled (GramJS MTProto)" : "Ready (Needs API ID/Hash)"}
+            </span>
+          </div>
+          <div className="flex justify-between items-center text-slate-400">
+            <span>50 MB Splitter Fallback:</span>
             <span className="text-emerald-400">Active (Lossless -c copy)</span>
           </div>
           <div className="flex justify-between items-center text-slate-400">

@@ -19,6 +19,7 @@ import {
   splitBinaryFile,
 } from "./server/splitter.ts";
 import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
+import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
 const PORT = 3000;
@@ -51,6 +52,26 @@ let botToken = process.env.TELEGRAM_BOT_TOKEN || "";
 let apiId = process.env.TELEGRAM_API_ID || "";
 let apiHash = process.env.TELEGRAM_API_HASH || "";
 let telegramService: TelegramService | null = botToken ? new TelegramService(botToken) : null;
+let mtprotoService: MTProtoService | null = null;
+
+function initMTProto() {
+  if (apiId && apiHash && botToken) {
+    const numericApiId = parseInt(apiId, 10);
+    if (!isNaN(numericApiId)) {
+      mtprotoService = new MTProtoService({
+        apiId: numericApiId,
+        apiHash,
+        botToken,
+      });
+      mtprotoService.connect().catch((err) => {
+        console.warn("MTProto initialization warning:", err);
+      });
+    }
+  } else {
+    mtprotoService = null;
+  }
+}
+initMTProto();
 let botInfo: TelegramBotInfo | null = null;
 let isPolling = false;
 let pollingOffset = 0;
@@ -408,30 +429,58 @@ async function executeDownloadJob(
 
         try {
           if (isExceedingTelegramLimit) {
-            await telegramService.sendMessage(
-              chatId,
-              `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) exceeds Telegram's 50 MB limit.\n✂️ Automatically splitting into playable parts for Telegram delivery...`
-            );
+            // Check if MTProto 2GB client is available
+            let uploadedViaMTProto = false;
+            if (mtprotoService) {
+              try {
+                await telegramService.sendMessage(
+                  chatId,
+                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is being uploaded in a single piece via Telegram MTProto (up to 2 GB)...`
+                );
+                const caption = `🎬 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+                uploadedViaMTProto = await mtprotoService.sendFile(
+                  chatId,
+                  pf.path,
+                  pf.filename,
+                  caption,
+                  (pct) => {
+                    if (pct % 25 === 0) {
+                      job.statusText = `Uploading to Telegram via MTProto: ${pct}%`;
+                    }
+                  }
+                );
+              } catch (mtErr: any) {
+                console.warn("MTProto 2GB upload attempt failed, falling back to split:", mtErr.message);
+                uploadedViaMTProto = false;
+              }
+            }
 
-            if (pf.isVideo) {
-              const parts = await splitVideo(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
-              pf.splitPartsCount = parts.length;
-              for (let pIdx = 0; pIdx < parts.length; pIdx++) {
-                const part = parts[pIdx];
-                const partCaption = `🎬 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
-                if (part.isVideo) {
-                  await telegramService.sendVideo(chatId, part.path, part.filename, partCaption);
-                } else {
+            if (!uploadedViaMTProto) {
+              await telegramService.sendMessage(
+                chatId,
+                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) exceeds 50 MB.\n✂️ Automatically splitting into playable parts for Telegram delivery...`
+              );
+
+              if (pf.isVideo) {
+                const parts = await splitVideo(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
+                pf.splitPartsCount = parts.length;
+                for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+                  const part = parts[pIdx];
+                  const partCaption = `🎬 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  if (part.isVideo) {
+                    await telegramService.sendVideo(chatId, part.path, part.filename, partCaption);
+                  } else {
+                    await telegramService.sendDocument(chatId, part.path, part.filename, partCaption);
+                  }
+                }
+              } else {
+                const parts = await splitBinaryFile(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
+                pf.splitPartsCount = parts.length;
+                for (let pIdx = 0; pIdx < parts.length; pIdx++) {
+                  const part = parts[pIdx];
+                  const partCaption = `📦 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
                   await telegramService.sendDocument(chatId, part.path, part.filename, partCaption);
                 }
-              }
-            } else {
-              const parts = await splitBinaryFile(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
-              pf.splitPartsCount = parts.length;
-              for (let pIdx = 0; pIdx < parts.length; pIdx++) {
-                const part = parts[pIdx];
-                const partCaption = `📦 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
-                await telegramService.sendDocument(chatId, part.path, part.filename, partCaption);
               }
             }
           } else {
@@ -585,6 +634,7 @@ app.post("/api/bot/config", async (req, res) => {
   }
 
   await updateBotInfo();
+  initMTProto();
   if (botToken && !isPolling) {
     startPolling();
   } else if (!botToken && isPolling) {

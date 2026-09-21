@@ -10,9 +10,11 @@
   "dependencies": {
     "adm-zip": "^0.5.16",
     "express": "^4.21.2",
+    "input": "^1.0.1",
     "lucide-react": "^0.475.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
