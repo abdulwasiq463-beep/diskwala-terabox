@@ -1,7 +1,8 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
+import { pipeline } from "stream/promises";
+import { Readable } from "stream";
 import {
   isTeraboxUrl,
   extractUrlFromText,
@@ -23,8 +24,23 @@ import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
 const PORT = Number(process.env.PORT) || 3000;
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
+const MAX_FILES_PER_LINK = 25;
+const MAX_SOURCE_FILE_SIZE_BYTES = 512 * 1024 * 1024;
+const MAX_ZIP_SIZE_BYTES = 250 * 1024 * 1024;
 const app = express();
 app.use(express.json());
+
+async function streamResponseToFile(response: Response, filePath: string) {
+  if (!response.body) {
+    throw new Error("Download response did not contain a readable body");
+  }
+
+  await pipeline(
+    Readable.fromWeb(response.body as import("stream/web").ReadableStream),
+    fs.createWriteStream(filePath)
+  );
+}
 
 // Track public base URL for direct download links
 let appPublicUrl =
@@ -105,6 +121,55 @@ function saveJobs() {
 // In-memory + persisted jobs store
 const jobs: DownloadJob[] = loadJobs();
 
+type DownloadQueueTask = {
+  url: string;
+  chatId?: number | string;
+  resolve: (job: DownloadJob) => void;
+  reject: (error: unknown) => void;
+};
+
+const downloadQueue: DownloadQueueTask[] = [];
+let isDownloadInProgress = false;
+
+function processDownloadQueue() {
+  if (isDownloadInProgress || downloadQueue.length === 0) return;
+
+  const task = downloadQueue.shift()!;
+  isDownloadInProgress = true;
+
+  processDownloadJob(task.url, task.chatId)
+    .then(task.resolve)
+    .catch(task.reject)
+    .finally(() => {
+      isDownloadInProgress = false;
+      processDownloadQueue();
+    });
+}
+
+function enqueueDownloadJob(url: string, chatId?: number | string): Promise<DownloadJob> {
+  if (downloadQueue.length >= MAX_QUEUE_SIZE) {
+    return Promise.reject(new Error("The download queue is full. Please try again in a few minutes."));
+  }
+
+  const waitingCount = downloadQueue.length + (isDownloadInProgress ? 1 : 0);
+
+  if (waitingCount > 0 && chatId && telegramService) {
+    telegramService
+      .sendMessage(
+        chatId,
+        `⏳ Your request is in line. There ${waitingCount === 1 ? "is" : "are"} ${waitingCount} job${waitingCount === 1 ? "" : "s"} ahead of it.`
+      )
+      .catch(() => {
+        // Ignore queue notification failures.
+      });
+  }
+
+  return new Promise<DownloadJob>((resolve, reject) => {
+    downloadQueue.push({ url, chatId, resolve, reject });
+    processDownloadQueue();
+  });
+}
+
 async function updateBotInfo() {
   if (!botToken) {
     botInfo = null;
@@ -176,7 +241,7 @@ async function pollTelegramUpdates() {
 
       if (isTeraboxUrl(text)) {
         const url = extractUrlFromText(text) || text;
-        executeDownloadJob(url, chatId).catch((err) => {
+        enqueueDownloadJob(url, chatId).catch((err) => {
           console.error("Job execution error from telegram message:", err);
         });
       } else {
@@ -220,7 +285,7 @@ function createProgressBar(percent: number, length: number = 10): string {
 }
 
 // Core execution engine
-async function executeDownloadJob(
+async function processDownloadJob(
   url: string,
   chatId?: number | string
 ): Promise<DownloadJob> {
@@ -311,13 +376,21 @@ async function executeDownloadJob(
     if (sourceFiles.length === 0) {
       throw new Error("No downloadable files were found in this TeraBox link.");
     }
+    if (sourceFiles.length > MAX_FILES_PER_LINK) {
+      throw new Error(`This link contains too many files. The maximum is ${MAX_FILES_PER_LINK}.`);
+    }
 
     const failedFiles: string[] = [];
     for (let fileIndex = 0; fileIndex < sourceFiles.length; fileIndex++) {
       const sourceFile = sourceFiles[fileIndex];
       const displayName = cleanFilename(sourceFile.filename || `file_${fileIndex + 1}`);
+      let downloadedFilePath = "";
 
       try {
+        if (sourceFile.sizeBytes > MAX_SOURCE_FILE_SIZE_BYTES) {
+          throw new Error("This file is too large for the available server memory and storage.");
+        }
+
         await updateStatus(
           "downloading",
           Math.min(80, 20 + Math.round((fileIndex / sourceFiles.length) * 60)),
@@ -325,8 +398,8 @@ async function executeDownloadJob(
         );
 
         let candidateName = displayName;
-        let actualFileBuffer: Buffer | null = null;
-        let downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
+        let hasDownloadedFile = false;
+        downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
 
         if (sourceFile.downloadUrl) {
           try {
@@ -339,16 +412,15 @@ async function executeDownloadJob(
               },
             });
             if (streamRes.ok) {
-              const arrayBuffer = await streamRes.arrayBuffer();
-              actualFileBuffer = Buffer.from(arrayBuffer);
-              fs.writeFileSync(downloadedFilePath, actualFileBuffer);
+              await streamResponseToFile(streamRes, downloadedFilePath);
+              hasDownloadedFile = fs.statSync(downloadedFilePath).size > 0;
             }
           } catch (downloadErr) {
             console.warn(`Direct download failed for ${displayName}:`, downloadErr);
           }
         }
 
-        if (!actualFileBuffer && sourceFile.streamUrl) {
+        if (!hasDownloadedFile && sourceFile.streamUrl) {
           await updateStatus("downloading", 50, `Preparing ${displayName}...`);
           if (!candidateName.toLowerCase().endsWith(".mp4")) {
             candidateName = `${candidateName.replace(/\.[^.]+$/, "")}.mp4`;
@@ -382,15 +454,16 @@ async function executeDownloadJob(
           );
 
           if (fs.existsSync(downloadedFilePath) && fs.statSync(downloadedFilePath).size > 0) {
-            actualFileBuffer = fs.readFileSync(downloadedFilePath);
+            hasDownloadedFile = true;
           }
         }
 
-        if (!actualFileBuffer) {
+        if (!hasDownloadedFile) {
           throw new Error("The file could not be downloaded");
         }
 
-        const detectedExt = detectExtensionFromBuffer(actualFileBuffer);
+        const fileHeader = fs.readFileSync(downloadedFilePath).subarray(0, 64);
+        const detectedExt = detectExtensionFromBuffer(fileHeader);
         if (detectedExt && !candidateName.toLowerCase().endsWith(detectedExt)) {
           const newName = `${candidateName}${detectedExt}`;
           const newPath = path.join(jobDir, `${fileIndex}_${newName}`);
@@ -403,6 +476,10 @@ async function executeDownloadJob(
         const isZip = candidateName.toLowerCase().endsWith(".zip") || detectedExt === ".zip";
         const isVideo = VIDEO_EXTENSIONS.has(path.extname(candidateName).toLowerCase());
         let unpackedCount = 0;
+
+        if (isZip && stats.size > MAX_ZIP_SIZE_BYTES) {
+          throw new Error("This ZIP archive is too large to unpack safely.");
+        }
 
         if (isZip) {
           await updateStatus("unpacking", 70, `📦 Unpacking ${displayName}...`);
@@ -435,6 +512,9 @@ async function executeDownloadJob(
         }
       } catch (fileErr) {
         console.warn(`Could not process ${displayName}:`, fileErr);
+        if (fs.existsSync(downloadedFilePath)) {
+          fs.rmSync(downloadedFilePath, { force: true });
+        }
         failedFiles.push(displayName);
       }
     }
@@ -741,7 +821,7 @@ app.post("/api/jobs", async (req, res) => {
   }
 
   const cleanUrl = extractUrlFromText(url) || url;
-  const job = await executeDownloadJob(cleanUrl, chatId);
+  const job = await enqueueDownloadJob(cleanUrl, chatId);
   res.json(job);
 });
 
@@ -824,29 +904,12 @@ app.post("/api/telegram/webhook", async (req, res) => {
   if (update?.message?.text && isTeraboxUrl(update.message.text)) {
     const chatId = update.message.chat.id;
     const url = extractUrlFromText(update.message.text) || update.message.text;
-    executeDownloadJob(url, chatId).catch(console.error);
+    enqueueDownloadJob(url, chatId).catch(console.error);
   }
   res.json({ ok: true });
 });
 
-// ==========================================
-// Vite / Static Middleware Setup
-// ==========================================
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
-
   app.listen(PORT, "0.0.0.0", async () => {
     console.log(`🚀 TeraBox Telegram Bot Server running on http://0.0.0.0:${PORT}`);
     await updateBotInfo();

@@ -15,3 +15,5 @@ services:
         sync: false
       - key: DATA_DIR
         value: /app/data
+      - key: MAX_QUEUE_SIZE
+        value: "100"

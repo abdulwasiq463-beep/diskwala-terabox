@@ -1,6 +1,7 @@
 import path from "path";
 import fs from "fs";
-import AdmZip from "adm-zip";
+import { pipeline } from "stream/promises";
+import unzipper from "unzipper";
 import { execFile } from "child_process";
 import { promisify } from "util";
 
@@ -656,28 +657,32 @@ export async function unpackZipArchive(
 ): Promise<{ path: string; filename: string; size: number }[]> {
   const results: { path: string; filename: string; size: number }[] = [];
   try {
-    const zip = new AdmZip(zipPath);
-    zip.extractAllTo(targetDir, true);
+    fs.mkdirSync(targetDir, { recursive: true });
+    const directory = await unzipper.Open.file(zipPath);
+    const usedNames = new Set<string>();
 
-    function walk(currentDir: string) {
-      const entries = fs.readdirSync(currentDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.name.startsWith(".") || entry.name === "__MACOSX") continue;
-        const fullPath = path.join(currentDir, entry.name);
-        if (entry.isDirectory()) {
-          walk(fullPath);
-        } else if (entry.isFile()) {
-          const stats = fs.statSync(fullPath);
-          results.push({
-            path: fullPath,
-            filename: entry.name,
-            size: stats.size,
-          });
-        }
+    for (const entry of directory.files) {
+      if (entry.type === "Directory" || entry.path.startsWith("__MACOSX/")) continue;
+
+      const baseName = cleanFilename(path.basename(entry.path));
+      let filename = baseName;
+      let suffix = 1;
+      while (usedNames.has(filename)) {
+        const extension = path.extname(baseName);
+        const stem = extension ? baseName.slice(0, -extension.length) : baseName;
+        filename = `${stem}_${suffix++}${extension}`;
       }
-    }
+      usedNames.add(filename);
 
-    walk(targetDir);
+      const outputPath = path.join(targetDir, filename);
+      await pipeline(entry.stream(), fs.createWriteStream(outputPath));
+      const stats = fs.statSync(outputPath);
+      results.push({
+        path: outputPath,
+        filename,
+        size: stats.size,
+      });
+    }
   } catch (err: any) {
     console.error("ZIP Unpack error:", err);
   }
