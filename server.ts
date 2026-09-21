@@ -725,6 +725,10 @@ app.get("/api/downloads/:jobId/:fileIndex", (req, res) => {
   }
 });
 
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", bot: botInfo?.username || "unknown", uptime: process.uptime() });
+});
+
 app.post("/api/telegram/webhook", async (req, res) => {
   // Webhook handler support
   const update = req.body;
@@ -754,8 +758,12 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, "0.0.0.0", async () => {
     console.log(`🚀 TeraBox Telegram Bot Server running on http://0.0.0.0:${PORT}`);
+    await updateBotInfo();
+    if (botToken) {
+      startPolling();
+    }
   });
 }
 
