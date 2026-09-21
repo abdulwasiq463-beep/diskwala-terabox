@@ -27,7 +27,9 @@ const app = express();
 app.use(express.json());
 
 // Track public base URL for direct download links
-let appPublicUrl = process.env.APP_URL || "";
+let appPublicUrl =
+  process.env.APP_URL ||
+  "https://ais-dev-jya4lggt2drjhja3yk5vs7-856843567695.asia-east1.run.app";
 
 app.use((req, res, next) => {
   if (req.headers.host) {
@@ -435,22 +437,38 @@ async function executeDownloadJob(
               try {
                 await telegramService.sendMessage(
                   chatId,
-                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is being uploaded in a single piece via Telegram MTProto (up to 2 GB)...`
+                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is being uploaded in full via Telegram MTProto (up to 2 GB)...`
                 );
-                const caption = `🎬 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
-                uploadedViaMTProto = await mtprotoService.sendFile(
+                
+                // 1. Upload as Video stream (streamable preview in Telegram)
+                const videoCaption = `🎬 *[Stream Video]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+                await mtprotoService.sendFile(
                   chatId,
                   pf.path,
                   pf.filename,
-                  caption,
+                  videoCaption,
                   (pct) => {
                     if (pct % 25 === 0) {
-                      job.statusText = `Uploading to Telegram via MTProto: ${pct}%`;
+                      job.statusText = `Uploading Video to Telegram: ${pct}%`;
                     }
-                  }
+                  },
+                  false // forceDocument = false -> Streamable video
                 );
+
+                // 2. Upload as Raw Document (100% untouched original file, zero Telegram compression)
+                const docCaption = `📁 *[Raw Original Document]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+                await mtprotoService.sendFile(
+                  chatId,
+                  pf.path,
+                  pf.filename,
+                  docCaption,
+                  undefined,
+                  true // forceDocument = true -> Raw file
+                );
+
+                uploadedViaMTProto = true;
               } catch (mtErr: any) {
-                console.warn("MTProto 2GB upload attempt failed, falling back to split:", mtErr.message);
+                console.warn("MTProto 2GB upload attempt failed, falling back to HTTP split:", mtErr.message);
                 uploadedViaMTProto = false;
               }
             }
@@ -458,7 +476,7 @@ async function executeDownloadJob(
             if (!uploadedViaMTProto) {
               await telegramService.sendMessage(
                 chatId,
-                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) exceeds 50 MB.\n✂️ Automatically splitting into playable parts for Telegram delivery...`
+                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) exceeds 50 MB.\n✂️ Automatically delivering playable video parts + uncompressed document parts...`
               );
 
               if (pf.isVideo) {
@@ -466,12 +484,12 @@ async function executeDownloadJob(
                 pf.splitPartsCount = parts.length;
                 for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                   const part = parts[pIdx];
-                  const partCaption = `🎬 *[Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
-                  if (part.isVideo) {
-                    await telegramService.sendVideo(chatId, part.path, part.filename, partCaption);
-                  } else {
-                    await telegramService.sendDocument(chatId, part.path, part.filename, partCaption);
-                  }
+                  // Send streamable video part
+                  const videoPartCaption = `🎬 *[Stream Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  await telegramService.sendVideo(chatId, part.path, part.filename, videoPartCaption);
+                  // Also send uncompressed document part
+                  const docPartCaption = `📁 *[Document Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  await telegramService.sendDocument(chatId, part.path, part.filename, docPartCaption);
                 }
               } else {
                 const parts = await splitBinaryFile(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
@@ -484,10 +502,15 @@ async function executeDownloadJob(
               }
             }
           } else {
-            const caption = `📄 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+            // File is <= 50 MB: send BOTH streamable video AND raw uncompressed document
             if (pf.isVideo) {
-              await telegramService.sendVideo(chatId, pf.path, pf.filename, caption);
+              const videoCaption = `🎬 *[Stream Video]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+              await telegramService.sendVideo(chatId, pf.path, pf.filename, videoCaption);
+
+              const docCaption = `📁 *[Raw Original Document]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+              await telegramService.sendDocument(chatId, pf.path, pf.filename, docCaption);
             } else {
+              const caption = `📄 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
               await telegramService.sendDocument(chatId, pf.path, pf.filename, caption);
             }
           }

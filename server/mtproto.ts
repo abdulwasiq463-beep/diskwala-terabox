@@ -65,7 +65,8 @@ export class MTProtoService {
     filePath: string,
     filename: string,
     caption?: string,
-    onProgress?: (progressPercent: number) => void
+    onProgress?: (progressPercent: number) => void,
+    forceDocument?: boolean
   ): Promise<boolean> {
     if (!this.isReady()) {
       const ok = await this.connect();
@@ -82,14 +83,15 @@ export class MTProtoService {
     const customFile = new CustomFile(filename, stat.size, filePath);
 
     const isVideo = /\.(mp4|mkv|mov|avi|webm|flv)$/i.test(filename);
+    const sendAsDoc = forceDocument !== undefined ? forceDocument : !isVideo;
 
-    console.log(`🚀 Starting MTProto 2GB upload for: ${filename} (${stat.size} bytes)`);
+    console.log(`🚀 Starting MTProto 2GB upload for: ${filename} (${stat.size} bytes, document=${sendAsDoc})`);
 
     // GramJS sendFile handles big files with upload.saveBigFilePart automatically
     await this.client!.sendFile(chatId, {
       file: customFile,
       caption: caption || filename,
-      forceDocument: !isVideo,
+      forceDocument: sendAsDoc,
       progressCallback: (progress: number) => {
         const pct = Math.round(progress * 100);
         if (onProgress) onProgress(pct);
