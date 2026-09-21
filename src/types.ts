@@ -20,6 +20,8 @@ export interface DownloadJob {
   files: ProcessedFile[];
   chatId?: string;
   error?: string;
+  retryCount?: number;
+  maxRetries?: number;
   createdAt: number;
   completedAt?: number;
   logs: string[];

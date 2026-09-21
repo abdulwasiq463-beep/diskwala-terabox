@@ -155,7 +155,7 @@ let pollingTimeoutId: NodeJS.Timeout | null = null;
 const botCommands = [
   { command: "start", description: "Start the bot" },
   { command: "queue", description: "View the current download queue" },
-  { command: "tasks", description: "View all waiting tasks" },
+  { command: "retries", description: "View the retry queue" },
   { command: "space", description: "Check server storage" },
   { command: "status", description: "Check bot status" },
   { command: "help", description: "Show help" },
@@ -191,12 +191,56 @@ type DownloadQueueTask = {
   url: string;
   chatId?: number | string;
   fileNames: string[] | null;
+  retryCount?: number;
   resolve: (job: DownloadJob) => void;
   reject: (error: unknown) => void;
 };
 
+type RetryQueueItem = {
+  url: string;
+  chatId?: number | string;
+  fileNames: string[] | null;
+  retryCount: number;
+  maxRetries: number;
+};
+
 const downloadQueue: DownloadQueueTask[] = [];
+const retryQueue: RetryQueueItem[] = [];
 let isDownloadInProgress = false;
+
+function getRetryDisplayName(fileNames: string[] | null, url: string): string {
+  const firstName = fileNames?.find((name) => !!name?.trim());
+  if (firstName) return firstName;
+
+  try {
+    const parsed = new URL(url);
+    const fallback = decodeURIComponent(parsed.pathname).split("/").filter(Boolean).pop();
+    return fallback || "download";
+  } catch {
+    return "download";
+  }
+}
+
+function getRetryLabel(item: Pick<RetryQueueItem, "fileNames" | "url" | "retryCount" | "maxRetries">): string {
+  return `${getRetryDisplayName(item.fileNames, item.url)} (retry ${item.retryCount}/${item.maxRetries})`;
+}
+
+function shouldRetryLink(retryCount: number, maxRetries: number): boolean {
+  return retryCount < maxRetries;
+}
+
+function queueRetryJob(url: string, chatId?: number | string, fileNames: string[] | null = null, retryCount = 1): void {
+  const nextRetryCount = retryCount;
+  const item: RetryQueueItem = {
+    url,
+    chatId,
+    fileNames,
+    retryCount: nextRetryCount,
+    maxRetries: MAX_RETRY_ATTEMPTS,
+  };
+
+  retryQueue.push(item);
+}
 
 async function resolveQueuedFileNames(task: DownloadQueueTask) {
   try {
@@ -211,14 +255,32 @@ async function resolveQueuedFileNames(task: DownloadQueueTask) {
 }
 
 function processDownloadQueue() {
-  if (isDownloadInProgress || downloadQueue.length === 0) return;
+  if (isDownloadInProgress) return;
+
+  if (downloadQueue.length === 0 && retryQueue.length > 0) {
+    const retryItem = retryQueue.shift()!;
+    downloadQueue.push({
+      url: retryItem.url,
+      chatId: retryItem.chatId,
+      fileNames: retryItem.fileNames,
+      retryCount: retryItem.retryCount,
+      resolve: () => undefined,
+      reject: () => undefined,
+    });
+  }
+
+  if (downloadQueue.length === 0) return;
 
   const task = downloadQueue.shift()!;
   isDownloadInProgress = true;
 
-  processDownloadJob(task.url, task.chatId)
-    .then(task.resolve)
-    .catch(task.reject)
+  processDownloadJob(task.url, task.chatId, task.retryCount ?? 0)
+    .then((job) => {
+      if (task.resolve) task.resolve(job);
+    })
+    .catch((error) => {
+      if (task.reject) task.reject(error);
+    })
     .finally(() => {
       isDownloadInProgress = false;
       processDownloadQueue();
@@ -309,11 +371,12 @@ async function pollTelegramUpdates() {
           chatId,
           `📖 *Help & Instructions*\n\n` +
             `1. Paste any TeraBox share link.\n` +
-          `2. I’ll download the files and check that they are valid.\n` +
-          `3. ZIP files are unpacked automatically.\n` +
-          `4. Large files are sent in full when possible, or split into smaller parts.\n\n` +
-          `📋 /queue or /tasks - See the current and waiting downloads.\n` +
-          `⚡ /status - See bot health and queue counts.`
+            `2. I’ll download the files and check that they are valid.\n` +
+            `3. ZIP files are unpacked automatically.\n` +
+            `4. Large files are sent in full when possible, or split into smaller parts.\n\n` +
+            `📋 /queue - See the current and waiting downloads.\n` +
+            `🔁 /retries - See how many links are waiting to be retried.\n` +
+            `⚡ /status - See bot health and queue counts.`
         );
         continue;
       }
@@ -327,12 +390,13 @@ async function pollTelegramUpdates() {
           `⚡ *Bot Status:* Online\n` +
             `📥 *Active Jobs:* ${activeCount}\n` +
             `⏳ *Waiting in Queue:* ${downloadQueue.length}\n` +
-            `📁 *Total Processed:* ${jobs.length}`
+            `� *Retry Queue:* ${retryQueue.length}\n` +
+            `�📁 *Total Processed:* ${jobs.length}`
         );
         continue;
       }
 
-      if (text === "/queue" || text === "/tasks") {
+      if (text === "/queue") {
         const activeJob = jobs.find(
           (j) => j.status !== "completed" && j.status !== "failed"
         );
@@ -359,6 +423,20 @@ async function pollTelegramUpdates() {
             activeLine +
             `⏱️ *Waiting:* ${downloadQueue.length}` +
             waitingLines
+        );
+        continue;
+      }
+
+      if (text === "/retries") {
+        const retryLines = retryQueue.length
+          ? retryQueue.map((item, index) => `${index + 1}. ${getRetryLabel(item)}`)
+          : ["✅ No links are currently queued for retry."];
+
+        await telegramService.sendMessage(
+          chatId,
+          `🔁 *Retry Queue*\n\n` +
+            `📊 *Queued retries:* ${retryQueue.length}\n\n` +
+            retryLines.join("\n")
         );
         continue;
       }
@@ -439,7 +517,8 @@ function createProgressBar(percent: number, length: number = 10): string {
 // Core execution engine
 async function processDownloadJob(
   url: string,
-  chatId?: number | string
+  chatId?: number | string,
+  retryCount = 0
 ): Promise<DownloadJob> {
   const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   const jobDir = path.join(DOWNLOADS_DIR, jobId);
@@ -453,6 +532,8 @@ async function processDownloadJob(
     statusText: "Analyzing TeraBox share link...",
     files: [],
     chatId: chatId ? String(chatId) : undefined,
+    retryCount,
+    maxRetries: MAX_RETRY_ATTEMPTS,
     createdAt: Date.now(),
     logs: [`[${new Date().toLocaleTimeString()}] Job initialized for ${url}`],
   };
@@ -855,6 +936,36 @@ async function processDownloadJob(
     saveJobs();
   } catch (err: any) {
     console.error("Job processing failed:", err);
+    const nextRetryCount = (job.retryCount ?? 0) + 1;
+    const canRetry = shouldRetryLink(job.retryCount ?? 0, MAX_RETRY_ATTEMPTS);
+
+    if (canRetry) {
+      job.retryCount = nextRetryCount;
+      job.status = "pending";
+      job.statusText = `Retrying download (${nextRetryCount}/${MAX_RETRY_ATTEMPTS})...`;
+      job.logs.push(`[${new Date().toLocaleTimeString()}] Retrying link (attempt ${nextRetryCount}/${MAX_RETRY_ATTEMPTS})`);
+      saveJobs();
+
+      const retryFileNames = job.files.length > 0 ? job.files.map((file) => file.filename) : null;
+      queueRetryJob(url, chatId, retryFileNames, nextRetryCount);
+
+      if (chatId && telegramService) {
+        const label = getRetryLabel({
+          fileNames: retryFileNames,
+          url,
+          retryCount: nextRetryCount,
+          maxRetries: MAX_RETRY_ATTEMPTS,
+        });
+        await telegramService.sendMessage(
+          chatId,
+          `🔁 *Retrying download*\n\n` +
+            `• ${label}`
+        );
+      }
+
+      return job;
+    }
+
     job.status = "failed";
     job.error = err.message || "Unknown download error";
     job.statusText = `Failed: ${job.error}`;
@@ -865,7 +976,7 @@ async function processDownloadJob(
       await telegramService.sendMessage(
         chatId,
         `❌ *Download Failed*\n\n` +
-          `I couldn’t download that link. It may be expired, private, or protected.\n\n` +
+          `I couldn’t download that link after ${MAX_RETRY_ATTEMPTS} attempts. It may be expired, private, or protected.\n\n` +
           `💡 *Tip:* Make sure the link is public and try again.`
       );
     }
