@@ -19,7 +19,7 @@ import {
   splitVideo,
   splitBinaryFile,
 } from "./server/splitter.ts";
-import { TelegramService, TelegramBotInfo, TelegramReplyMarkup } from "./server/telegram.ts";
+import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
 import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
@@ -65,6 +65,19 @@ const UNPACKED_DIR = path.join(DATA_DIR, "unpacked");
 fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 fs.mkdirSync(UNPACKED_DIR, { recursive: true });
 
+function getDirectorySize(directory: string): number {
+  let totalBytes = 0;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      totalBytes += getDirectorySize(entryPath);
+    } else if (entry.isFile()) {
+      totalBytes += fs.statSync(entryPath).size;
+    }
+  }
+  return totalBytes;
+}
+
 // Bot configuration state
 let botToken = process.env.TELEGRAM_BOT_TOKEN || "";
 let apiId = process.env.TELEGRAM_API_ID || "";
@@ -95,11 +108,14 @@ let isPolling = false;
 let pollingOffset = 0;
 let pollingTimeoutId: NodeJS.Timeout | null = null;
 
-const botReplyKeyboard: TelegramReplyMarkup = {
-  keyboard: [[{ text: "/queue" }, { text: "/tasks" }], [{ text: "/status" }, { text: "/help" }]],
-  resize_keyboard: true,
-  is_persistent: true,
-};
+const botCommands = [
+  { command: "start", description: "Start the bot" },
+  { command: "queue", description: "View the current download queue" },
+  { command: "tasks", description: "View all waiting tasks" },
+  { command: "space", description: "Check server storage" },
+  { command: "status", description: "Check bot status" },
+  { command: "help", description: "Show help" },
+];
 
 // Jobs persistence file
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
@@ -185,6 +201,7 @@ async function updateBotInfo() {
   try {
     telegramService = new TelegramService(botToken);
     botInfo = await telegramService.getMe();
+    await telegramService.setMyCommands(botCommands);
     console.log(`🤖 Telegram Bot authenticated: @${botInfo.username}`);
   } catch (err: any) {
     console.warn(`⚠️ Telegram authentication notice: ${err.message}`);
@@ -215,9 +232,7 @@ async function pollTelegramUpdates() {
             `• terabox.com, terabox.app, teraboxlink.com\n` +
             `• 1024tera.com, 1024terabox.com, terafileshare.com\n` +
             `• nephobox, mirrobox, 4funbox, dubox, and all shortlinks!\n\n` +
-            `_ZIP archives are automatically unpacked and videos are formatted for streaming._`,
-          "Markdown",
-          botReplyKeyboard
+            `_ZIP archives are automatically unpacked and videos are formatted for streaming._`
         );
         continue;
       }
@@ -270,6 +285,26 @@ async function pollTelegramUpdates() {
             activeLine +
             `⏱️ *Waiting:* ${downloadQueue.length}` +
             waitingLines
+        );
+        continue;
+      }
+
+      if (text === "/space" || text === "/disk") {
+        const filesystem = fs.statfsSync(DATA_DIR);
+        const blockSize = Number(filesystem.bsize);
+        const totalBytes = Number(filesystem.blocks) * blockSize;
+        const freeBytes = Number(filesystem.bavail) * blockSize;
+        const usedBytes = totalBytes - Number(filesystem.bfree) * blockSize;
+        const usedPercent = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0;
+
+        await telegramService.sendMessage(
+          chatId,
+          `💾 *Server Storage*\n\n` +
+            `• *Location:* \`${DATA_DIR}\`\n` +
+            `• *Used:* ${formatBytes(usedBytes)} (${usedPercent}%)\n` +
+            `• *Free:* ${formatBytes(freeBytes)}\n` +
+            `• *Total:* ${formatBytes(totalBytes)}\n` +
+            `• *Bot files:* ${formatBytes(getDirectorySize(DATA_DIR))}`
         );
         continue;
       }
