@@ -22,7 +22,7 @@ import { TelegramService, TelegramBotInfo } from "./server/telegram.ts";
 import { MTProtoService } from "./server/mtproto.ts";
 import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const app = express();
 app.use(express.json());
 
@@ -154,9 +154,9 @@ async function pollTelegramUpdates() {
           chatId,
           `📖 *Help & Instructions*\n\n` +
             `1. Paste any TeraBox share link.\n` +
-            `2. The bot resolves the link, downloads the files, and checks magic bytes.\n` +
-            `3. ZIP files are uncompressed and individual files sent directly.\n` +
-            `4. Upload limit: 50 MB in standard cloud mode.`
+          `2. I’ll download the files and check that they are valid.\n` +
+          `3. ZIP files are unpacked automatically.\n` +
+          `4. Large files are sent in full when possible, or split into smaller parts.`
         );
         continue;
       }
@@ -251,7 +251,7 @@ async function executeDownloadJob(
         chatId,
         `⏳ *TeraBox Downloader*\n\n` +
           `\`${createProgressBar(10)}\` 10%\n` +
-          `• *Status:* Initializing connection...`
+          `• *Status:* Getting everything ready...`
       );
       tgStatusMsgId = sent.message_id;
     } catch {
@@ -291,8 +291,7 @@ async function executeDownloadJob(
             tgStatusMsgId,
             `⏳ *TeraBox Processing*\n\n` +
               `[${bar}] *${roundedProgress}%*\n\n` +
-              `• *Action:* ${text}\n` +
-              `• *Job ID:* \`${jobId}\``
+                `• *Progress:* ${text}`
           );
         } catch {
           // ignore edit conflicts
@@ -302,144 +301,153 @@ async function executeDownloadJob(
   };
 
   try {
-    await updateStatus("resolving", 25, "Resolving share link metadata & mirror domain...");
+    await updateStatus("resolving", 25, "Checking your TeraBox link...");
     const metadata = await resolveTeraboxLink(url);
 
-    await updateStatus("downloading", 45, `Downloading file content (${metadata.title})...`);
-
-    // Download or prepare file
-    let candidateName = cleanFilename(metadata.title || "terabox_download");
-    const downloadedFilePath = path.join(jobDir, candidateName);
-
-    let actualFileBuffer: Buffer | null = null;
-    let directDownloaded = false;
-
-    // Check if direct dlink is present and accessible
-    const firstDirectUrl = metadata.files.find((f) => f.downloadUrl)?.downloadUrl;
-    if (firstDirectUrl) {
-      try {
-        const streamRes = await fetch(firstDirectUrl, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
-            Referer: metadata.refererUrl || "https://www.terabox.app/",
-            ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
-          },
-        });
-        if (streamRes.ok) {
-          const arrayBuffer = await streamRes.arrayBuffer();
-          actualFileBuffer = Buffer.from(arrayBuffer);
-          fs.writeFileSync(downloadedFilePath, actualFileBuffer);
-          directDownloaded = true;
-        }
-      } catch (dlErr) {
-        console.warn("Direct stream fetch failed:", dlErr);
-      }
-    }
-
-    // Check if streamUrl (M3U8 HLS stream) is available for video files
-    const firstStreamFile = metadata.files.find((f) => f.streamUrl);
-    const firstStreamUrl = firstStreamFile?.streamUrl;
-    if (!directDownloaded && firstStreamUrl) {
-      try {
-        await updateStatus("downloading", 50, `Fetching media stream for ${candidateName}...`);
-        
-        // Ensure .mp4 extension
-        if (!candidateName.toLowerCase().endsWith(".mp4")) {
-          candidateName = `${candidateName.replace(/\.[^.]+$/, "")}.mp4`;
-        }
-        const videoTargetPath = path.join(jobDir, candidateName);
-
-        await downloadM3u8Stream(
-          firstStreamUrl,
-          videoTargetPath,
-          metadata.refererUrl || "https://www.terabox.app/",
-          metadata.cookies,
-          async (percent, curr, tot) => {
-            const calculatedProgress = Math.min(80, 25 + Math.round((percent / 100) * 55));
-            await updateStatus(
-              "downloading",
-              calculatedProgress,
-              `Downloading stream: [${curr}/${tot}] chunks (${percent}%)`
-            );
-          },
-          {
-            duration: firstStreamFile?.duration,
-            shareId: metadata.shareId,
-            uk: metadata.uk,
-            sign: metadata.sign || firstStreamFile?.sign,
-            timestamp: metadata.timestamp || firstStreamFile?.timestamp,
-            fsId: firstStreamFile?.fsId,
-            randsk: metadata.randsk,
-          }
-        );
-
-        if (fs.existsSync(videoTargetPath) && fs.statSync(videoTargetPath).size > 0) {
-          actualFileBuffer = fs.readFileSync(videoTargetPath);
-          directDownloaded = true;
-        }
-      } catch (streamErr: any) {
-        console.warn("M3U8 stream download failed, checking fallback:", streamErr);
-      }
-    }
-
-    if (!directDownloaded) {
-      throw new Error(
-        "Could not establish direct media stream or download URL for this file from TeraBox. The link might be expired, private, or protected by captcha."
-      );
-    }
-
-    // Magic bytes extension detection
-    const detectedExt = actualFileBuffer
-      ? detectExtensionFromBuffer(actualFileBuffer)
-      : null;
-    if (detectedExt && !candidateName.endsWith(detectedExt)) {
-      const newName = `${candidateName}${detectedExt}`;
-      const newPath = path.join(jobDir, newName);
-      fs.renameSync(path.join(jobDir, candidateName), newPath);
-      candidateName = newName;
-    }
-
-    const currentFilePath = path.join(jobDir, candidateName);
-    const stats = fs.statSync(currentFilePath);
-    const isZip =
-      candidateName.toLowerCase().endsWith(".zip") ||
-      (detectedExt && detectedExt === ".zip");
-    const isVideo = VIDEO_EXTENSIONS.has(path.extname(candidateName).toLowerCase());
+    await updateStatus("downloading", 45, `Downloading ${metadata.title || "your file"}...`);
 
     const processedFiles: ProcessedFile[] = [];
+    const sourceFiles = metadata.files.filter((file) => file.downloadUrl || file.streamUrl);
+    if (sourceFiles.length === 0) {
+      throw new Error("No downloadable files were found in this TeraBox link.");
+    }
 
-    // ZIP Auto-unpacking
-    if (isZip) {
-      await updateStatus("unpacking", 70, "📦 ZIP archive detected! Unpacking files...");
-      const unpackDir = path.join(UNPACKED_DIR, jobId);
-      fs.mkdirSync(unpackDir, { recursive: true });
+    const failedFiles: string[] = [];
+    for (let fileIndex = 0; fileIndex < sourceFiles.length; fileIndex++) {
+      const sourceFile = sourceFiles[fileIndex];
+      const displayName = cleanFilename(sourceFile.filename || `file_${fileIndex + 1}`);
 
-      const unpackedList = await unpackZipArchive(currentFilePath, unpackDir);
-      if (unpackedList.length > 0) {
-        for (const uf of unpackedList) {
-          const uExt = path.extname(uf.filename).toLowerCase();
+      try {
+        await updateStatus(
+          "downloading",
+          Math.min(80, 20 + Math.round((fileIndex / sourceFiles.length) * 60)),
+          `Downloading ${displayName} (${fileIndex + 1}/${sourceFiles.length})...`
+        );
+
+        let candidateName = displayName;
+        let actualFileBuffer: Buffer | null = null;
+        let downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
+
+        if (sourceFile.downloadUrl) {
+          try {
+            const streamRes = await fetch(sourceFile.downloadUrl, {
+              headers: {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
+                Referer: metadata.refererUrl || "https://www.terabox.app/",
+                ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
+              },
+            });
+            if (streamRes.ok) {
+              const arrayBuffer = await streamRes.arrayBuffer();
+              actualFileBuffer = Buffer.from(arrayBuffer);
+              fs.writeFileSync(downloadedFilePath, actualFileBuffer);
+            }
+          } catch (downloadErr) {
+            console.warn(`Direct download failed for ${displayName}:`, downloadErr);
+          }
+        }
+
+        if (!actualFileBuffer && sourceFile.streamUrl) {
+          await updateStatus("downloading", 50, `Preparing ${displayName}...`);
+          if (!candidateName.toLowerCase().endsWith(".mp4")) {
+            candidateName = `${candidateName.replace(/\.[^.]+$/, "")}.mp4`;
+            downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
+          }
+
+          await downloadM3u8Stream(
+            sourceFile.streamUrl,
+            downloadedFilePath,
+            metadata.refererUrl || "https://www.terabox.app/",
+            metadata.cookies,
+            async (percent) => {
+              const fileStart = 20 + Math.round((fileIndex / sourceFiles.length) * 60);
+              const fileProgress = Math.round(60 / sourceFiles.length);
+              const calculatedProgress = Math.min(80, fileStart + Math.round((percent / 100) * fileProgress));
+              await updateStatus(
+                "downloading",
+                calculatedProgress,
+                `Downloading ${displayName}... ${percent}%`
+              );
+            },
+            {
+              duration: sourceFile.duration,
+              shareId: metadata.shareId,
+              uk: metadata.uk,
+              sign: metadata.sign || sourceFile.sign,
+              timestamp: metadata.timestamp || sourceFile.timestamp,
+              fsId: sourceFile.fsId,
+              randsk: metadata.randsk,
+            }
+          );
+
+          if (fs.existsSync(downloadedFilePath) && fs.statSync(downloadedFilePath).size > 0) {
+            actualFileBuffer = fs.readFileSync(downloadedFilePath);
+          }
+        }
+
+        if (!actualFileBuffer) {
+          throw new Error("The file could not be downloaded");
+        }
+
+        const detectedExt = detectExtensionFromBuffer(actualFileBuffer);
+        if (detectedExt && !candidateName.toLowerCase().endsWith(detectedExt)) {
+          const newName = `${candidateName}${detectedExt}`;
+          const newPath = path.join(jobDir, `${fileIndex}_${newName}`);
+          fs.renameSync(downloadedFilePath, newPath);
+          downloadedFilePath = newPath;
+          candidateName = newName;
+        }
+
+        const stats = fs.statSync(downloadedFilePath);
+        const isZip = candidateName.toLowerCase().endsWith(".zip") || detectedExt === ".zip";
+        const isVideo = VIDEO_EXTENSIONS.has(path.extname(candidateName).toLowerCase());
+        let unpackedCount = 0;
+
+        if (isZip) {
+          await updateStatus("unpacking", 70, `📦 Unpacking ${displayName}...`);
+          const unpackDir = path.join(UNPACKED_DIR, jobId, String(fileIndex));
+          fs.mkdirSync(unpackDir, { recursive: true });
+          const unpackedList = await unpackZipArchive(downloadedFilePath, unpackDir);
+          for (const unpackedFile of unpackedList) {
+            unpackedCount++;
+            const unpackedExt = path.extname(unpackedFile.filename).toLowerCase();
+            processedFiles.push({
+              filename: unpackedFile.filename,
+              sizeBytes: unpackedFile.size,
+              sizeFormatted: formatBytes(unpackedFile.size),
+              path: unpackedFile.path,
+              isVideo: VIDEO_EXTENSIONS.has(unpackedExt),
+              isZip: false,
+            });
+          }
+        }
+
+        if (!isZip || unpackedCount === 0) {
           processedFiles.push({
-            filename: uf.filename,
-            sizeBytes: uf.size,
-            sizeFormatted: formatBytes(uf.size),
-            path: uf.path,
-            isVideo: VIDEO_EXTENSIONS.has(uExt),
-            isZip: false,
+            filename: candidateName,
+            sizeBytes: stats.size,
+            sizeFormatted: formatBytes(stats.size),
+            path: downloadedFilePath,
+            isVideo,
+            isZip,
           });
         }
+      } catch (fileErr) {
+        console.warn(`Could not process ${displayName}:`, fileErr);
+        failedFiles.push(displayName);
       }
     }
 
     if (processedFiles.length === 0) {
-      processedFiles.push({
-        filename: candidateName,
-        sizeBytes: stats.size,
-        sizeFormatted: formatBytes(stats.size),
-        path: currentFilePath,
-        isVideo,
-        isZip: !!isZip,
-      });
+      throw new Error("None of the files in this TeraBox link could be downloaded.");
+    }
+
+    if (failedFiles.length > 0 && chatId && telegramService) {
+      await telegramService.sendMessage(
+        chatId,
+        `⚠️ I could not download ${failedFiles.length} file(s): ${failedFiles.join(", ")}. I’ll still send the files that worked.`
+      );
     }
 
     // Assign direct download URLs
@@ -457,7 +465,7 @@ async function executeDownloadJob(
       await updateStatus(
         "uploading",
         85,
-        `📤 Delivering ${processedFiles.length} file(s) to Telegram...`
+        `📤 Sending ${processedFiles.length} file(s) to you...`
       );
 
       for (let i = 0; i < processedFiles.length; i++) {
@@ -474,11 +482,11 @@ async function executeDownloadJob(
               try {
                 await telegramService.sendMessage(
                   chatId,
-                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is being uploaded in full via Telegram MTProto (up to 2 GB)...`
+                  `🚀 *${pf.filename}* (${pf.sizeFormatted}) is large, so I’m sending it in full. This may take a little while...`
                 );
                 
                 // 1. Upload as Video stream (streamable preview in Telegram)
-                const videoCaption = `🎬 *[Stream Video]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+                const videoCaption = `🎬 *[Video Preview]* \`${pf.filename}\` (${pf.sizeFormatted})`;
                 await mtprotoService.sendFile(
                   chatId,
                   pf.path,
@@ -489,21 +497,10 @@ async function executeDownloadJob(
                     await updateStatus(
                       "uploading",
                       uploadProgress,
-                      `Uploading video to Telegram (${pct}%)`
+                      `Sending your video... ${pct}%`
                     );
                   },
                   false // forceDocument = false -> Streamable video
-                );
-
-                // 2. Upload as Raw Document (100% untouched original file, zero Telegram compression)
-                const docCaption = `📁 *[Raw Original Document]* \`${pf.filename}\` (${pf.sizeFormatted})`;
-                await mtprotoService.sendFile(
-                  chatId,
-                  pf.path,
-                  pf.filename,
-                  docCaption,
-                  undefined,
-                  true // forceDocument = true -> Raw file
                 );
 
                 uploadedViaMTProto = true;
@@ -516,7 +513,7 @@ async function executeDownloadJob(
             if (!uploadedViaMTProto) {
               await telegramService.sendMessage(
                 chatId,
-                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) exceeds 50 MB.\n✂️ Automatically delivering playable video parts + uncompressed document parts...`
+                `ℹ️ *${pf.filename}* (${pf.sizeFormatted}) is too large for one message.\n✂️ I’ll send it as smaller parts...`
               );
 
               if (pf.isVideo) {
@@ -525,11 +522,8 @@ async function executeDownloadJob(
                 for (let pIdx = 0; pIdx < parts.length; pIdx++) {
                   const part = parts[pIdx];
                   // Send streamable video part
-                  const videoPartCaption = `🎬 *[Stream Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
+                  const videoPartCaption = `🎬 *[Video Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
                   await telegramService.sendVideo(chatId, part.path, part.filename, videoPartCaption);
-                  // Also send uncompressed document part
-                  const docPartCaption = `📁 *[Document Part ${pIdx + 1}/${parts.length}]* \`${part.filename}\` (${formatBytes(part.size)})`;
-                  await telegramService.sendDocument(chatId, part.path, part.filename, docPartCaption);
                 }
               } else {
                 const parts = await splitBinaryFile(pf.path, jobDir, MAX_TELEGRAM_FILE_SIZE);
@@ -542,13 +536,10 @@ async function executeDownloadJob(
               }
             }
           } else {
-            // File is <= 50 MB: send BOTH streamable video AND raw uncompressed document
+            // File is <= 50 MB: send videos as streamable Telegram videos.
             if (pf.isVideo) {
-              const videoCaption = `🎬 *[Stream Video]* \`${pf.filename}\` (${pf.sizeFormatted})`;
+              const videoCaption = `🎬 *[Video Preview]* \`${pf.filename}\` (${pf.sizeFormatted})`;
               await telegramService.sendVideo(chatId, pf.path, pf.filename, videoCaption);
-
-              const docCaption = `📁 *[Raw Original Document]* \`${pf.filename}\` (${pf.sizeFormatted})`;
-              await telegramService.sendDocument(chatId, pf.path, pf.filename, docCaption);
             } else {
               const caption = `📄 *[${i + 1}/${processedFiles.length}]* \`${pf.filename}\` (${pf.sizeFormatted})`;
               await telegramService.sendDocument(chatId, pf.path, pf.filename, caption);
@@ -566,7 +557,7 @@ async function executeDownloadJob(
             try {
               await telegramService.sendMessage(
                 chatId,
-                `✂️ File exceeds Telegram Bot limit. Splitting into smaller parts...`
+                `✂️ That file is too large for one message. Splitting it into smaller parts...`
               );
               const parts = pf.isVideo
                 ? await splitVideo(pf.path, jobDir, 45 * 1024 * 1024)
@@ -584,13 +575,13 @@ async function executeDownloadJob(
             } catch (splitErr: any) {
               await telegramService.sendMessage(
                 chatId,
-                `⚠️ Could not upload \`${pf.filename}\`: ${uploadErr.message}`
+                `⚠️ I couldn’t send \`${pf.filename}\`. Please try again or use a smaller file.`
               );
             }
           } else {
             await telegramService.sendMessage(
               chatId,
-              `⚠️ Could not upload \`${pf.filename}\`: ${uploadErr.message}`
+              `⚠️ I couldn’t send \`${pf.filename}\`. Please try again.`
             );
           }
         }
@@ -604,21 +595,6 @@ async function executeDownloadJob(
         }
       }
 
-      let directDownloadLinks = "";
-      if (appPublicUrl) {
-        const linksList = processedFiles
-          .map((f, idx) => `• [${f.filename}](${appPublicUrl}/api/downloads/${job.id}/${idx}) (${f.sizeFormatted})`)
-          .join("\n");
-        directDownloadLinks = `\n\n🌐 *Direct Web Download (Full Uncut):*\n${linksList}`;
-      }
-
-      await telegramService.sendMessage(
-        chatId,
-        `✅ *Download & Delivery Complete!*\n\n` +
-          `• *Files delivered:* ${processedFiles.length}\n` +
-          `• *Source:* ${url}` +
-          directDownloadLinks
-      );
     }
 
     job.status = "completed";
@@ -639,8 +615,8 @@ async function executeDownloadJob(
       await telegramService.sendMessage(
         chatId,
         `❌ *Download Failed*\n\n` +
-          `*Error:* ${job.error}\n\n` +
-          `💡 *Tip:* Ensure the link is valid and publicly shared without restricted password.`
+          `I couldn’t download that link. It may be expired, private, or protected.\n\n` +
+          `💡 *Tip:* Make sure the link is public and try again.`
       );
     }
   }

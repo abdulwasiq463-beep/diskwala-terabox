@@ -204,16 +204,13 @@ export class TelegramService {
       }
 
       if (data.ok) return data.result;
-      console.warn("Video upload failed, falling back to document:", data.description);
+      throw new Error(data.description || "Failed to send video to Telegram");
     } catch (err: any) {
       if (err.message && err.message.includes("Request Entity Too Large")) {
         throw err;
       }
-      console.warn("Video send exception, fallback to document:", err);
+      throw err;
     }
-
-    // Fallback to document
-    return this.sendDocument(chatId, filePath, filename, caption);
   }
 
   async getUpdates(offset: number = 0, timeout: number = 10): Promise<TelegramUpdate[]> {

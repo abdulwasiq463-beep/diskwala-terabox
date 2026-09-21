@@ -20,7 +20,7 @@ export default function App() {
 
   useEffect(() => {
     fetchStatus();
-    const timer = setInterval(fetchStatus, 3000);
+    const timer = setInterval(fetchStatus, 1000);
     return () => clearInterval(timer);
   }, []);
 
