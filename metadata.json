@@ -1,0 +1,8 @@
+{
+  "name": "TeraBox Telegram Bot",
+  "description": "Download and process TeraBox links directly to Telegram with zip auto-unpacking and web manager",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
