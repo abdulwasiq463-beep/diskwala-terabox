@@ -211,6 +211,14 @@ function stopPolling() {
   console.log("⏹️ Telegram Polling stopped");
 }
 
+// Visual progress bar generator for Telegram messages
+function createProgressBar(percent: number, length: number = 10): string {
+  const bounded = Math.max(0, Math.min(100, Math.round(percent)));
+  const filledCount = Math.round((bounded / 100) * length);
+  const emptyCount = length - filledCount;
+  return "■".repeat(filledCount) + "□".repeat(emptyCount);
+}
+
 // Core execution engine
 async function executeDownloadJob(
   url: string,
@@ -241,7 +249,9 @@ async function executeDownloadJob(
     try {
       const sent = await telegramService.sendMessage(
         chatId,
-        `⏳ *Processing TeraBox Link...*\nConnecting to server...`
+        `⏳ *TeraBox Downloader*\n\n` +
+          `\`${createProgressBar(10)}\` 10%\n` +
+          `• *Status:* Initializing connection...`
       );
       tgStatusMsgId = sent.message_id;
     } catch {
@@ -249,10 +259,14 @@ async function executeDownloadJob(
     }
   }
 
+  let lastTgUpdateTime = 0;
+  let lastTgProgress = -1;
+
   const updateStatus = async (
     status: DownloadJob["status"],
     progress: number,
-    text: string
+    text: string,
+    forceTelegramUpdate: boolean = false
   ) => {
     job.status = status;
     job.progress = progress;
@@ -260,11 +274,30 @@ async function executeDownloadJob(
     job.logs.push(`[${new Date().toLocaleTimeString()}] ${text}`);
 
     if (chatId && telegramService && tgStatusMsgId) {
-      await telegramService.editMessageText(
-        chatId,
-        tgStatusMsgId,
-        `⏳ *TeraBox Processor*\n${text}`
-      );
+      const now = Date.now();
+      const roundedProgress = Math.round(progress);
+      // Throttle telegram message edits to max once every 1.5 seconds or on major milestone to prevent Telegram 429 rate limit
+      if (
+        forceTelegramUpdate ||
+        (now - lastTgUpdateTime > 1500 && Math.abs(roundedProgress - lastTgProgress) >= 5) ||
+        roundedProgress === 100
+      ) {
+        lastTgUpdateTime = now;
+        lastTgProgress = roundedProgress;
+        const bar = createProgressBar(roundedProgress, 12);
+        try {
+          await telegramService.editMessageText(
+            chatId,
+            tgStatusMsgId,
+            `⏳ *TeraBox Processing*\n\n` +
+              `[${bar}] *${roundedProgress}%*\n\n` +
+              `• *Action:* ${text}\n` +
+              `• *Job ID:* \`${jobId}\``
+          );
+        } catch {
+          // ignore edit conflicts
+        }
+      }
     }
   };
 
@@ -323,8 +356,12 @@ async function executeDownloadJob(
           metadata.refererUrl || "https://www.terabox.app/",
           metadata.cookies,
           async (percent, curr, tot) => {
-            job.progress = Math.min(85, 45 + Math.round((percent / 100) * 35));
-            job.statusText = `Downloading video stream: segment ${curr}/${tot} (${percent}%)`;
+            const calculatedProgress = Math.min(80, 25 + Math.round((percent / 100) * 55));
+            await updateStatus(
+              "downloading",
+              calculatedProgress,
+              `Downloading stream: [${curr}/${tot}] chunks (${percent}%)`
+            );
           },
           {
             duration: firstStreamFile?.duration,
@@ -447,10 +484,13 @@ async function executeDownloadJob(
                   pf.path,
                   pf.filename,
                   videoCaption,
-                  (pct) => {
-                    if (pct % 25 === 0) {
-                      job.statusText = `Uploading Video to Telegram: ${pct}%`;
-                    }
+                  async (pct) => {
+                    const uploadProgress = Math.min(98, 85 + Math.round((pct / 100) * 12));
+                    await updateStatus(
+                      "uploading",
+                      uploadProgress,
+                      `Uploading video to Telegram (${pct}%)`
+                    );
                   },
                   false // forceDocument = false -> Streamable video
                 );
