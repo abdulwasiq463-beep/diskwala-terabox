@@ -25,6 +25,8 @@ import type { DownloadJob, ProcessedFile, BotStatus } from "./src/types.ts";
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
+const MAX_RETRY_ATTEMPTS = 5;
+const RETRY_DELAY_MS = 1500;
 const MAX_FILES_PER_LINK = 25;
 const MAX_SOURCE_FILE_SIZE_BYTES = 512 * 1024 * 1024;
 const MAX_ZIP_SIZE_BYTES = 250 * 1024 * 1024;
@@ -40,6 +42,24 @@ async function streamResponseToFile(response: Response, filePath: string) {
     Readable.fromWeb(response.body as import("stream/web").ReadableStream),
     fs.createWriteStream(filePath)
   );
+}
+
+async function withRetries<T>(operation: () => Promise<T>, label: string): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      console.warn(`${label} failed (attempt ${attempt}/${MAX_RETRY_ATTEMPTS}):`, error);
+      if (attempt < MAX_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS * attempt));
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(`${label} failed`);
 }
 
 // Track public base URL for direct download links
@@ -77,6 +97,30 @@ function getDirectorySize(directory: string): number {
   }
   return totalBytes;
 }
+
+function cleanupJobFiles(jobId: string) {
+  for (const baseDir of [DOWNLOADS_DIR, UNPACKED_DIR]) {
+    try {
+      fs.rmSync(path.join(baseDir, jobId), { recursive: true, force: true });
+    } catch (cleanupErr) {
+      console.warn(`Could not clean temporary files for ${jobId}:`, cleanupErr);
+    }
+  }
+}
+
+function cleanupTemporaryDirectories() {
+  for (const directory of [DOWNLOADS_DIR, UNPACKED_DIR]) {
+    try {
+      for (const entry of fs.readdirSync(directory)) {
+        fs.rmSync(path.join(directory, entry), { recursive: true, force: true });
+      }
+    } catch (cleanupErr) {
+      console.warn(`Could not clean temporary directory ${directory}:`, cleanupErr);
+    }
+  }
+}
+
+cleanupTemporaryDirectories();
 
 // Bot configuration state
 let botToken = process.env.TELEGRAM_BOT_TOKEN || "";
@@ -146,12 +190,25 @@ const jobs: DownloadJob[] = loadJobs();
 type DownloadQueueTask = {
   url: string;
   chatId?: number | string;
+  fileNames: string[] | null;
   resolve: (job: DownloadJob) => void;
   reject: (error: unknown) => void;
 };
 
 const downloadQueue: DownloadQueueTask[] = [];
 let isDownloadInProgress = false;
+
+async function resolveQueuedFileNames(task: DownloadQueueTask) {
+  try {
+    const metadata = await withRetries(
+      () => resolveTeraboxLink(task.url),
+      "Queued link inspection"
+    );
+    task.fileNames = metadata.files.map((file) => cleanFilename(file.filename));
+  } catch {
+    task.fileNames = [];
+  }
+}
 
 function processDownloadQueue() {
   if (isDownloadInProgress || downloadQueue.length === 0) return;
@@ -187,7 +244,17 @@ function enqueueDownloadJob(url: string, chatId?: number | string): Promise<Down
   }
 
   return new Promise<DownloadJob>((resolve, reject) => {
-    downloadQueue.push({ url, chatId, resolve, reject });
+    const task: DownloadQueueTask = {
+      url,
+      chatId,
+      fileNames: null,
+      resolve,
+      reject,
+    };
+    downloadQueue.push(task);
+    resolveQueuedFileNames(task).catch(() => {
+      task.fileNames = [];
+    });
     processDownloadQueue();
   });
 }
@@ -270,10 +337,17 @@ async function pollTelegramUpdates() {
           (j) => j.status !== "completed" && j.status !== "failed"
         );
         const queueLines = downloadQueue.map(
-          (task, index) => `${index + 1}. ${task.url}`
+          (task, index) =>
+            `${index + 1}. ${task.fileNames === null
+              ? "Checking file names..."
+              : task.fileNames.length > 0
+                ? task.fileNames.join(", ")
+                : "File names unavailable"}`
         );
         const activeLine = activeJob
-          ? `🔄 *Now processing:* ${activeJob.url}\n`
+          ? `🔄 *Now processing:* ${activeJob.files.length > 0
+            ? activeJob.files.map((file) => file.filename).join(", ")
+            : "Checking file names..."}\n`
           : "🔄 *Now processing:* Nothing\n";
         const waitingLines = queueLines.length
           ? `\n⏳ *Waiting links:*\n${queueLines.join("\n")}`
@@ -296,15 +370,23 @@ async function pollTelegramUpdates() {
         const freeBytes = Number(filesystem.bavail) * blockSize;
         const usedBytes = totalBytes - Number(filesystem.bfree) * blockSize;
         const usedPercent = totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 100) : 0;
+        const botFilesBytes = getDirectorySize(DATA_DIR);
+        const temporaryDownloadsBytes = getDirectorySize(DOWNLOADS_DIR);
+        const unpackedFilesBytes = getDirectorySize(UNPACKED_DIR);
 
         await telegramService.sendMessage(
           chatId,
-          `💾 *Server Storage*\n\n` +
-            `• *Location:* \`${DATA_DIR}\`\n` +
+          `💾 *Bot Storage*\n\n` +
+            `📦 *Bot files:* ${formatBytes(botFilesBytes)}\n` +
+            `⬇️ *Temporary downloads:* ${formatBytes(temporaryDownloadsBytes)}\n` +
+            `🗜️ *Unpacked files:* ${formatBytes(unpackedFilesBytes)}\n` +
+            `🧹 *Cleanup:* after every job and on startup\n` +
+            `⏳ *Queue:* ${isDownloadInProgress ? "1 active" : "No active job"}, ${downloadQueue.length} waiting\n\n` +
+            `🖥️ *Container filesystem reference*\n` +
             `• *Used:* ${formatBytes(usedBytes)} (${usedPercent}%)\n` +
             `• *Free:* ${formatBytes(freeBytes)}\n` +
             `• *Total:* ${formatBytes(totalBytes)}\n` +
-            `• *Bot files:* ${formatBytes(getDirectorySize(DATA_DIR))}`
+            `• *Location:* \`${DATA_DIR}\``
         );
         continue;
       }
@@ -437,7 +519,10 @@ async function processDownloadJob(
 
   try {
     await updateStatus("resolving", 25, "Checking your TeraBox link...");
-    const metadata = await resolveTeraboxLink(url);
+    const metadata = await withRetries(
+      () => resolveTeraboxLink(url),
+      "TeraBox link resolution"
+    );
 
     await updateStatus("downloading", 45, `Downloading ${metadata.title || "your file"}...`);
 
@@ -473,18 +558,25 @@ async function processDownloadJob(
 
         if (sourceFile.downloadUrl) {
           try {
-            const streamRes = await fetch(sourceFile.downloadUrl, {
-              headers: {
-                "User-Agent":
-                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
-                Referer: metadata.refererUrl || "https://www.terabox.app/",
-                ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
+            const streamRes = await withRetries(
+              async () => {
+                const response = await fetch(sourceFile.downloadUrl!, {
+                  headers: {
+                    "User-Agent":
+                      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0",
+                    Referer: metadata.refererUrl || "https://www.terabox.app/",
+                    ...(metadata.cookies ? { Cookie: metadata.cookies } : {}),
+                  },
+                });
+                if (!response.ok) {
+                  throw new Error(`Download returned HTTP ${response.status}`);
+                }
+                return response;
               },
-            });
-            if (streamRes.ok) {
-              await streamResponseToFile(streamRes, downloadedFilePath);
-              hasDownloadedFile = fs.statSync(downloadedFilePath).size > 0;
-            }
+              `Direct download for ${displayName}`
+            );
+            await streamResponseToFile(streamRes, downloadedFilePath);
+            hasDownloadedFile = fs.statSync(downloadedFilePath).size > 0;
           } catch (downloadErr) {
             console.warn(`Direct download failed for ${displayName}:`, downloadErr);
           }
@@ -497,30 +589,38 @@ async function processDownloadJob(
             downloadedFilePath = path.join(jobDir, `${fileIndex}_${candidateName}`);
           }
 
-          await downloadM3u8Stream(
-            sourceFile.streamUrl,
-            downloadedFilePath,
-            metadata.refererUrl || "https://www.terabox.app/",
-            metadata.cookies,
-            async (percent) => {
-              const fileStart = 20 + Math.round((fileIndex / sourceFiles.length) * 60);
-              const fileProgress = Math.round(60 / sourceFiles.length);
-              const calculatedProgress = Math.min(80, fileStart + Math.round((percent / 100) * fileProgress));
-              await updateStatus(
-                "downloading",
-                calculatedProgress,
-                `Downloading ${displayName}... ${percent}%`
+          await withRetries(
+            async () => {
+              if (fs.existsSync(downloadedFilePath)) {
+                fs.rmSync(downloadedFilePath, { force: true });
+              }
+              await downloadM3u8Stream(
+                sourceFile.streamUrl!,
+                downloadedFilePath,
+                metadata.refererUrl || "https://www.terabox.app/",
+                metadata.cookies,
+                async (percent) => {
+                  const fileStart = 20 + Math.round((fileIndex / sourceFiles.length) * 60);
+                  const fileProgress = Math.round(60 / sourceFiles.length);
+                  const calculatedProgress = Math.min(80, fileStart + Math.round((percent / 100) * fileProgress));
+                  await updateStatus(
+                    "downloading",
+                    calculatedProgress,
+                    `Downloading ${displayName}... ${percent}%`
+                  );
+                },
+                {
+                  duration: sourceFile.duration,
+                  shareId: metadata.shareId,
+                  uk: metadata.uk,
+                  sign: metadata.sign || sourceFile.sign,
+                  timestamp: metadata.timestamp || sourceFile.timestamp,
+                  fsId: sourceFile.fsId,
+                  randsk: metadata.randsk,
+                }
               );
             },
-            {
-              duration: sourceFile.duration,
-              shareId: metadata.shareId,
-              uk: metadata.uk,
-              sign: metadata.sign || sourceFile.sign,
-              timestamp: metadata.timestamp || sourceFile.timestamp,
-              fsId: sourceFile.fsId,
-              randsk: metadata.randsk,
-            }
+            `Video download for ${displayName}`
           );
 
           if (fs.existsSync(downloadedFilePath) && fs.statSync(downloadedFilePath).size > 0) {
@@ -770,6 +870,8 @@ async function processDownloadJob(
       );
     }
   }
+
+  cleanupJobFiles(jobId);
 
   return job;
 }
