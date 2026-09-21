@@ -27,6 +27,7 @@ const PORT = Number(process.env.PORT) || 3000;
 const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE) || 100;
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAY_MS = 1500;
+const DOWNLOAD_STATUS_REFRESH_MS = 1000;
 const MAX_FILES_PER_LINK = 25;
 const MAX_SOURCE_FILE_SIZE_BYTES = 512 * 1024 * 1024;
 const MAX_ZIP_SIZE_BYTES = 250 * 1024 * 1024;
@@ -564,6 +565,7 @@ async function processDownloadJob(
     status: DownloadJob["status"],
     progress: number,
     text: string,
+    sizeLabel?: string,
     forceTelegramUpdate: boolean = false
   ) => {
     job.status = status;
@@ -577,18 +579,21 @@ async function processDownloadJob(
       // Throttle telegram message edits to max once every 1.5 seconds or on major milestone to prevent Telegram 429 rate limit
       if (
         forceTelegramUpdate ||
-        (now - lastTgUpdateTime > 1500 && Math.abs(roundedProgress - lastTgProgress) >= 5) ||
+        (now - lastTgUpdateTime > DOWNLOAD_STATUS_REFRESH_MS && Math.abs(roundedProgress - lastTgProgress) >= 5) ||
         roundedProgress === 100
       ) {
         lastTgUpdateTime = now;
         lastTgProgress = roundedProgress;
         const bar = createProgressBar(roundedProgress, 12);
+        const barLine = sizeLabel
+          ? `[${bar}] *${roundedProgress}%* (${sizeLabel})`
+          : `[${bar}] *${roundedProgress}%*`;
         try {
           await telegramService.editMessageText(
             chatId,
             tgStatusMsgId,
             `⏳ *TeraBox Processing*\n\n` +
-              `[${bar}] *${roundedProgress}%*\n\n` +
+              `${barLine}\n\n` +
                 `• *Progress:* ${text}`
           );
         } catch {
@@ -605,8 +610,6 @@ async function processDownloadJob(
       "TeraBox link resolution"
     );
 
-    await updateStatus("downloading", 45, `Downloading ${metadata.title || "your file"}...`);
-
     const processedFiles: ProcessedFile[] = [];
     const sourceFiles = metadata.files.filter((file) => file.downloadUrl || file.streamUrl);
     if (sourceFiles.length === 0) {
@@ -615,6 +618,14 @@ async function processDownloadJob(
     if (sourceFiles.length > MAX_FILES_PER_LINK) {
       throw new Error(`This link contains too many files. The maximum is ${MAX_FILES_PER_LINK}.`);
     }
+
+    const totalSourceSize = sourceFiles.reduce((sum, file) => sum + (file.sizeBytes || 0), 0);
+    await updateStatus(
+      "downloading",
+      45,
+      `Downloading ${metadata.title || "your file"}...`,
+      formatBytes(totalSourceSize)
+    );
 
     const failedFiles: string[] = [];
     for (let fileIndex = 0; fileIndex < sourceFiles.length; fileIndex++) {
@@ -630,7 +641,8 @@ async function processDownloadJob(
         await updateStatus(
           "downloading",
           Math.min(80, 20 + Math.round((fileIndex / sourceFiles.length) * 60)),
-          `Downloading ${displayName} (${fileIndex + 1}/${sourceFiles.length})...`
+          `Downloading ${displayName} (${fileIndex + 1}/${sourceFiles.length})...`,
+          formatBytes(sourceFile.sizeBytes)
         );
 
         let candidateName = displayName;
@@ -687,7 +699,8 @@ async function processDownloadJob(
                   await updateStatus(
                     "downloading",
                     calculatedProgress,
-                    `Downloading ${displayName}... ${percent}%`
+                    `Downloading ${displayName}... ${percent}%`,
+                    formatBytes(sourceFile.sizeBytes)
                   );
                 },
                 {
